@@ -94,43 +94,35 @@ decompose_effects <- function(dat,
   cda_fun <- function(samp) {
     samp$R <- factor(samp$R)
     
-    # mediator model: M ~ R + Cs
-    if (nzchar(Cpart)) {
-      form_m <-as.formula(paste("M ~ R +", Cpart)) 
-    } else {
-      form_m <-as.formula(paste("M ~ R"))
-    } 
+    # smi() bootstraps with update(fit, data = y.data.b). The stored call
+    # must contain a language formula (M ~ R + ...), not a formula object or
+    # a symbol like form_m; otherwise model.frame looks up y.data.b in the
+    # formula environment and fails.
+    terms_m <- c("R", if (nzchar(Cpart)) Cs)
+    form_m  <- as.formula(paste("M ~", paste(terms_m, collapse = " + ")))
+    fit.m   <- lm(form_m, data = samp)
+    fit.m$call$formula <- str2lang(paste("M ~", paste(terms_m, collapse = " + ")))
     
-    
-    # outcome model: Y ~ R + M + adjust
-    if (nzchar(Cpart) & nzchar(Xpart)) {
-      fit.y <- lm(Y ~ R + X + M + C, data=samp)  
-    } else if (nzchar(Cpart)) {
-      fit.y <- lm(Y ~ R + M + C, data=samp) 
-    } else if (nzchar(Xpart)) {
-      fit.y <- lm(Y ~ R + M + X, data=samp) 
-    } else {
-      fit.y <- lm(Y ~ R + M, data=samp) 
-    }
-    
-    
-    fit.m <- lm(form_m, data=samp)
+    terms_y <- c("R", if (nzchar(Xpart)) Xs, "M", if (nzchar(Cpart)) Cs)
+    form_y  <- as.formula(paste("Y ~", paste(terms_y, collapse = " + ")))
+    fit.y   <- lm(form_y, data = samp)
+    fit.y$call$formula <- str2lang(paste("Y ~", paste(terms_y, collapse = " + ")))
     
     if (nzchar(Cpart)){
-      fit_cda <- smi(fit.m=fit.m, fit.y=fit.y, sims=200, conf.level = .95,
-                     covariates =  c("C"),
-                     treat="R")
+      fit_cda <- smi(fit.m = fit.m, fit.y = fit.y, sims = 200, conf.level = .95,
+                     covariates = Cs,
+                     group = "R")
       
-      c(tau   = fit_cda$result[1,"estimate"],
-        zeta  = fit_cda$result[2,"estimate"],
-        delta = fit_cda$result[3,"estimate"])
+      c(tau   = fit_cda$result[1, "estimate"],
+        zeta  = fit_cda$result[2, "estimate"],
+        delta = fit_cda$result[3, "estimate"])
     } else {
-      tau   <- coef( lm(Y ~ R, data = samp)       )[2]
-      delta <- coef(fit.y)[3] * coef(fit.m)[2]
+      tau   <- coef(lm(Y ~ R, data = samp))[2]
+      delta <- coef(fit.y)["M"] * unname(coef(fit.m)[2])
       
       c(tau = tau,
-        delta = delta, 
-        zeta = tau-delta)
+        delta = delta,
+        zeta = tau - delta)
     }
     
   }
@@ -162,8 +154,125 @@ decompose_effects <- function(dat,
                    quantile(cda_boot$tau.R1,.975))
       ) }
   
-  # bind and return all three
-  bind_rows(dic_sum, kob_sum, cda_sum)
+  # 4) Modified DIC (Section 3.4) ------------------------------------------
+  Xvar <- if (nzchar(Xpart)) Xs else NULL
+  Cvar <- if (nzchar(Cpart)) Cs else NULL
+  
+  set.seed(seed + 3)
+  mdic_boot <- replicate(B, est_modified_dic(dat %>% sample_n(n_sample), Xvar, Cvar),
+                         simplify = FALSE) %>%
+    bind_rows()
+  mdic_sum <- tibble(
+    Method = "DIC.mod",
+    Effect = c("Red", "Rem", "Ini"),
+    Mean   = c(mean(mdic_boot$delta), mean(mdic_boot$zeta), mean(mdic_boot$tau)),
+    `2.5%` = c(quantile(mdic_boot$delta, .025),
+               quantile(mdic_boot$zeta,  .025),
+               quantile(mdic_boot$tau,   .025)),
+    `97.5%`= c(quantile(mdic_boot$delta, .975),
+               quantile(mdic_boot$zeta,  .975),
+               quantile(mdic_boot$tau,   .975))
+  )
+  
+  # 5) Modified KOB (Section 3.4) ------------------------------------------
+  set.seed(seed + 4)
+  mkob_boot <- replicate(B, est_modified_kob(dat %>% sample_n(n_sample), Xvar, Cvar),
+                         simplify = FALSE) %>%
+    bind_rows()
+  mkob_sum <- tibble(
+    Method = "KOB.mod",
+    Effect = c("Red", "Rem", "Ini"),
+    Mean   = c(-mean(mkob_boot$delta), -mean(mkob_boot$zeta), -mean(mkob_boot$tau)),
+    `2.5%` = c(-quantile(mkob_boot$delta, .025),
+               -quantile(mkob_boot$zeta,  .025),
+               -quantile(mkob_boot$tau,   .025)),
+    `97.5%`= c(-quantile(mkob_boot$delta, .975),
+               -quantile(mkob_boot$zeta,  .975),
+               -quantile(mkob_boot$tau,   .975))
+  )
+  
+  # Paper order: 3.1 DIC, 3.2 KOB, 3.3 CDA, 3.4 DIC.mod then KOB.mod
+  bind_rows(dic_sum, kob_sum, cda_sum, mdic_sum, mkob_sum)
+}
+
+# 4) Modified DIC (Section 3.4; Jackson & VanderWeele 2018).
+# Scalar X: Red = (ω1 - ε1) + (1 - ε2/ω2)(ς1 - ω1); Ini = ς1 from Y ~ R + C.
+# Vector X: the scalar identity is (1 - ε2/ω2)(ς1 - ω1) = β_R (ω2 - ε2),
+# where β_R is the coefficient of R in X ~ R + C. The same path algebra
+# with a vector of intermediate confounders is β_R'(ω_X - ε_X); it
+# reduces exactly to Section 3.4 when length(X) = 1.
+est_modified_dic <- function(samp, Xvar = NULL, Cvar = NULL) {
+  Xvars <- if (is.null(Xvar) || !nzchar(paste(Xvar, collapse = ""))) character(0) else as.character(Xvar)
+  Cvars <- if (is.null(Cvar) || !nzchar(paste(Cvar, collapse = ""))) character(0) else as.character(Cvar)
+  rhs <- function(...) {
+    parts <- c("R", unlist(list(...), use.names = FALSE))
+    parts <- parts[!is.na(parts) & nzchar(parts)]
+    paste(parts, collapse = " + ")
+  }
+  f_xc  <- as.formula(paste("Y ~", rhs(Xvars, Cvars)))
+  f_xcm <- as.formula(paste("Y ~", rhs("M", Xvars, Cvars)))
+  f_c   <- as.formula(paste("Y ~", rhs(Cvars)))
+  
+  fit_xc  <- lm(f_xc,  data = samp)
+  fit_xcm <- lm(f_xcm, data = samp)
+  fit_c   <- lm(f_c,   data = samp)
+  
+  omega1  <- unname(coef(fit_xc)["R"])
+  eps1    <- unname(coef(fit_xcm)["R"])
+  varsig1 <- unname(coef(fit_c)["R"])
+  
+  if (length(Xvars) == 0L) {
+    delta <- omega1 - eps1
+  } else if (length(Xvars) == 1L) {
+    omega2 <- unname(coef(fit_xc)[Xvars])
+    eps2   <- unname(coef(fit_xcm)[Xvars])
+    if (isTRUE(abs(omega2) < .Machine$double.eps * 100)) {
+      stop("Modified DIC: coef of X in Y ~ R + X + C is ~0; adjustment term is undefined.")
+    }
+    delta <- (omega1 - eps1) + (1 - eps2 / omega2) * (varsig1 - omega1)
+  } else {
+    omega_x <- unname(coef(fit_xc)[Xvars])
+    eps_x   <- unname(coef(fit_xcm)[Xvars])
+    beta_R  <- vapply(Xvars, function(xj) {
+      unname(coef(lm(as.formula(paste(xj, "~", rhs(Cvars))), data = samp))["R"])
+    }, numeric(1))
+    delta <- (omega1 - eps1) + sum(beta_R * (omega_x - eps_x))
+  }
+  tau  <- varsig1
+  zeta <- tau - delta
+  c(delta = delta, zeta = zeta, tau = tau)
+}
+
+# 5) Modified KOB (Section 3.4): residualize Y and M for centered C, then standard KOB.
+est_modified_kob <- function(samp, Xvar = NULL, Cvar = NULL) {
+  Xvars <- if (is.null(Xvar) || !nzchar(paste(Xvar, collapse = ""))) character(0) else as.character(Xvar)
+  Cvars <- if (is.null(Cvar) || !nzchar(paste(Cvar, collapse = ""))) character(0) else as.character(Cvar)
+  keep <- unique(c("Y", "M", "R", Xvars, Cvars))
+  tmp <- samp[, keep, drop = FALSE]
+  tmp$R_num <- as.numeric(as.character(tmp$R))
+  
+  if (length(Cvars) >= 1L) {
+    ct <- paste0(Cvars, "_t")
+    for (i in seq_along(Cvars)) {
+      tmp[[ct[i]]] <- tmp[[Cvars[i]]] - mean(tmp[[Cvars[i]]])
+    }
+    f_adj <- as.formula(paste("Y ~ R_num +", paste(ct, collapse = " + ")))
+    fit_y <- lm(f_adj, data = tmp)
+    fit_m <- lm(update(f_adj, M ~ .), data = tmp)
+    for (nm in ct) {
+      tmp$Y <- tmp$Y - unname(coef(fit_y)[nm]) * tmp[[nm]]
+      tmp$M <- tmp$M - unname(coef(fit_m)[nm]) * tmp[[nm]]
+    }
+  }
+  tmp$R <- factor(tmp$R)
+  
+  # C stays in the group regression. Residualizing Y and M does not take C
+  # out of X, so Y ~ X + M | R attributes part of M to X when U links X and M.
+  form_ox <- as.formula(paste("Y ~", paste(c(Xvars, "M", Cvars), collapse = " + "), "| R"))
+  ox   <- oaxaca(form_ox, data = tmp, R = 1)
+  raw  <- ox$y$y.diff
+  expM <- ox$twofold$variables[[6]]["M", "coef(explained)"]
+  c(delta = unname(expM), zeta = unname(raw - expM), tau = unname(raw))
 }
 
 sens.for.se <- function(boot.res, fit.y, fit.m = NULL, mediators = NULL, covariates, treat, sel.lev.treat,
